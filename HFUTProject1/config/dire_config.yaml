@@ -1,0 +1,17 @@
+diffusion:
+  num_diffusion_timesteps: 1000
+  steps: 20
+model:
+  type: "simple"
+  in_channels: 3
+  out_ch: 3
+  ch: 128
+  ch_mult: [1, 1, 2, 2, 4, 4]
+  num_res_blocks: 2
+  attn_resolutions: [16]
+  dropout: 0.0
+training:
+  batch_size: 32
+  learning_rate: 1e-4
+  epochs: 10
+  device: "cuda"
