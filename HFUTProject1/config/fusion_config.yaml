@@ -1,0 +1,41 @@
+# 数据配置
+data:
+  train_path: "./data/processed/train"
+  val_path: "./data/processed/val"
+  test_path: "./data/processed/test"
+  input_size: 256
+  batch_size: 32
+  num_workers: 4
+
+# 特征提取器配置
+dnf:
+  model_path: "./models/pre-trained/diffusion_model.pth"
+  enabled: True
+
+dire:
+  vae_path: "./models/pre-trained/vae.pth"
+  enabled: True
+
+lgrad:
+  backbone: "resnet50"
+  pretrained_weights: "./models/pre-trained/resnet_ssl.pth"
+  gradient_layers: ["layer3", "layer4"]
+
+ssp:
+  patch_size: 64
+  num_patches: 16
+
+# 融合模型训练配置
+fusion:
+  num_heads: 8
+  feature_dim: 256
+  dropout: 0.1
+  lr: 5e-5
+  epochs: 100
+  adversarial_epsilon: 0.03
+
+# 优化器配置
+optimizer:
+  type: "AdamW"
+  weight_decay: 0.01
+  momentum: 0.9

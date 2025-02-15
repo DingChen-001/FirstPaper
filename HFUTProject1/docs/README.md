@@ -1,29 +1,11 @@
-# AI-Generated Image Detection
+# 运行流程
 
-## Project Structure
+- 数据准备：将原始数据按目录结构放入data/raw/
 
-- `data/`: Dataset storage.
-- `models/`: Model weights and pre-trained models.
-- `src/`: Source code.
-- `logs/`: Logs and visualizations.
-- `experiments/`: Experiment reports.
-- `config/`: Configuration files.
-- `docs/`: Documentation.
+- 单特征预训练：运行 python main.py --stage pretrain --config config/dnf_config.yaml
 
-## Getting Started
+- 融合模型训练：运行 python main.py --stage fusion
 
-1. **Dataset Preparation**: Place your datasets in `data/`.
-2. **Training**: Run `python src/train.py` to train the model.
-3. **Testing**: Run `python src/test.py` to evaluate the model.
+- 性能评估：运行 python main.py --stage test
 
-## Dependencies
-
-- Python 3.8+
-- PyTorch 1.9+
-- torchvision
-- numpy
-- pillow
-
-## Citation
-
-If you use this code, please cite the relevant papers.
+- 模型导出：执行 python deploy/convert_onnx.py
