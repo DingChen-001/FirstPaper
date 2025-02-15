@@ -1,5 +1,5 @@
 处理起始目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1
-处理时间: 2025-02-15 12:43:23
+处理时间: 2025-02-15 16:55:30
 
 └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\config
   └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\config\crossvit.yaml
@@ -384,36 +384,52 @@ class AdversarialAugment:
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\features\dim_reduction.py
        文件内容:
-    import torch.nn as nn
+    import torch
+import torch.nn as nn
+from sklearn.decomposition import PCA
 
-class FeatureReducer(nn.Module):
+class HybridReducer(nn.Module):
     """
-    统一特征降维与归一化处理（适用于所有输入特征）
-    支持动态维度适配与多种归一化策略选择
+    混合降维策略：
+    - 训练阶段：使用可学习的1x1卷积降维
+    - 推理阶段：可选PCA降维（需提前拟合）
+    - 支持多种归一化方法
     """
-    def __init__(self, in_dim, out_dim=256, norm_type='layer'):
+    def __init__(self, in_dim, out_dim=256, norm_type='bn', use_pca=False):
         super().__init__()
-        # 降维层
-        self.reducer = nn.Sequential(
+        # 可学习降维
+        self.conv_reducer = nn.Sequential(
             nn.Conv2d(in_dim, out_dim, 1),
             nn.GELU()
         )
         
-        # 归一化选择
+        # PCA降维器
+        self.pca = PCA(n_components=out_dim) if use_pca else None
+        self.use_pca = use_pca
+        
+        # 归一化层
         self.norm = {
-            'layer': nn.LayerNorm(out_dim),
-            'batch': nn.BatchNorm2d(out_dim),
-            'instance': nn.InstanceNorm2d(out_dim)
+            'bn': nn.BatchNorm2d(out_dim),
+            'ln': nn.LayerNorm([out_dim, 1, 1]),
+            'in': nn.InstanceNorm2d(out_dim)
         }[norm_type]
 
+    def fit_pca(self, features):
+        """离线拟合PCA"""
+        flattened = features.view(-1, features.size(1)).cpu().numpy()
+        self.pca.fit(flattened)
+        
     def forward(self, x):
-        reduced = self.reducer(x)
-        # 归一化（保持维度兼容性）
-        if isinstance(self.norm, nn.LayerNorm):
-            B, C, H, W = reduced.shape
-            return self.norm(reduced.view(B, C, -1).transpose(1,2)).transpose(1,2).view(B, C, H, W)
+        if self.training or not self.use_pca:
+            # 训练模式使用卷积降维
+            reduced = self.conv_reducer(x)
         else:
-            return self.norm(reduced)
+            # 推理模式可选PCA
+            x_flat = x.permute(0,2,3,1).view(-1, x.size(1))
+            reduced = torch.tensor(self.pca.transform(x_flat.cpu())).to(x.device)
+            reduced = reduced.view(x.size(0), x.size(2), x.size(3), -1).permute(0,3,1,2)
+            
+        return self.norm(reduced)
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\features\dire.py
        文件内容:
@@ -666,63 +682,32 @@ class CrossScaleAttention(nn.Module):
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\fusion_layers\weighted_fusion.py
        文件内容:
-    # src/fusion_layers/weighted_fusion.py
-class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
+    class SmartFusion(nn.Module):
+    def __init__(self, feat_dims, cfg):
         super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Conv2d(in_planes, in_planes//ratio, 1),
-            nn.ReLU(),
-            nn.Conv2d(in_planes//ratio, in_planes, 1)
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.fc(self.avg_pool(x))
-        max_out = self.fc(self.max_pool(x))
-        return self.sigmoid(avg_out + max_out)
-
-class FeatureFusion(nn.Module):
-    def __init__(self, feature_dims):
-        super().__init__()
-        self.attentions = nn.ModuleDict({
-            name: ChannelAttention(dim) for name, dim in feature_dims.items()
-        })
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(sum(feature_dims.values()), 512, 1),
-            nn.BatchNorm2d(512),
-            nn.GELU()
-        )
-
-    def forward(self, features):
-        # 通道注意力加权
-        weighted = {}
-        for name, feat in features.items():
-            attn = self.attentions[name](feat)
-            weighted[name] = feat * attn
-        
-        # 拼接并降维
-        fused = torch.cat(list(weighted.values()), dim=1)
-        return self.fusion_conv(fused)
-    
-class EnhancedFusion(nn.Module):
-    def __init__(self, feat_dims):
-        super().__init__()
-        # 初始化各特征的降维器
+        # 动态配置降维器
         self.reducers = nn.ModuleDict({
-            name: FeatureReducer(dim, norm_type='layer') 
-            for name, dim in feat_dims.items()
+            name: HybridReducer(
+                dim, 
+                out_dim=cfg.fusion.reduced_dim,
+                norm_type=cfg.norm_type,
+                use_pca=cfg.use_pca
+            ) for name, dim in feat_dims.items()
         })
         
-        # 注意力融合层
-        self.fusion = FeatureFusion(feat_dims={k:256 for k in feat_dims})
+        # 自适应权重融合
+        self.weights = nn.ParameterDict({
+            name: nn.Parameter(torch.ones(1)) for name in feat_dims.keys()
+        })
 
     def forward(self, features):
-        # 降维+归一化
-        reduced_feats = {name: self.reducers[name](feat) for name, feat in features.items()}
-        return self.fusion(reduced_feats)
+        # 降维与归一化
+        reduced = {name: reducer(feat) for name, (feat, reducer) in zip(features, self.reducers)}
+        
+        # 加权融合
+        total_weight = sum([self.weights[name] for name in features.keys()])
+        fused = sum([reduced[name] * (self.weights[name]/total_weight) for name in features.keys()])
+        return fused
 
   └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\losses
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\losses\feature_loss.py
@@ -847,69 +832,88 @@ if __name__ == "__main__":
   └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\models
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\models\crossvit.py
        文件内容:
-    from timm.models.vision_transformer import Block
-
-class CrossViTClassifier(nn.Module):
+    class CrossViT(nn.Module):
     """
-    完整CrossViT实现,支持：
-    - 多尺度patch嵌入
-    - 交叉注意力机制
-    - 分类头微调
+    完整CrossViT架构，包含：
+    - 双分支多尺度处理
+    - 交叉注意力融合
+    - 分类头适配
     """
-    def __init__(self, config):
+    def __init__(self, cfg):
         super().__init__()
-        # 多尺度嵌入
-        self.patch_embeds = nn.ModuleList([
-            PatchEmbed(img_size=config.img_size, 
-                      patch_size=ps, 
-                      in_chans=config.in_chans,
-                      embed_dim=config.embed_dim)
-            for ps in config.patch_sizes
-        ])
+        # 分支1：小尺度处理
+        self.branch_small = self._build_branch(
+            img_size=cfg.img_size,
+            patch_size=cfg.patch_sizes[0],
+            embed_dim=cfg.embed_dim,
+            depth=cfg.depth
+        )
         
-        # 交叉注意力块
-        self.blocks = nn.ModuleList([
-            Block(dim=config.embed_dim, 
-                  num_heads=config.num_heads,
-                  mlp_ratio=config.mlp_ratio)
-            for _ in range(config.depth)
-        ])
+        # 分支2：大尺度处理
+        self.branch_large = self._build_branch(
+            img_size=cfg.img_size,
+            patch_size=cfg.patch_sizes[1],
+            embed_dim=cfg.embed_dim,
+            depth=cfg.depth
+        )
+        
+        # 交叉注意力模块
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=cfg.embed_dim,
+            num_heads=cfg.num_heads
+        )
         
         # 分类头
-        self.head = nn.Linear(config.embed_dim * len(config.patch_sizes), config.num_classes)
+        self.head = nn.Sequential(
+            nn.LayerNorm(cfg.embed_dim * 2),
+            nn.Linear(cfg.embed_dim * 2, cfg.num_classes)
+        )
+
+    def _build_branch(self, img_size, patch_size, embed_dim, depth):
+        return nn.Sequential(
+            PatchEmbed(img_size, patch_size, 3, embed_dim),
+            *[TransformerBlock(embed_dim, num_heads=8) for _ in range(depth)]
+        )
 
     def forward(self, x):
-        multi_scale = []
-        for embed in self.patch_embeds:
-            # 多尺度特征提取
-            feat = embed(x)
-            cls_token = self.cls_token.expand(feat.shape[0], -1, -1)
-            feat = torch.cat((cls_token, feat), dim=1)
-            
-            # 交叉注意力处理
-            for blk in self.blocks:
-                feat = blk(feat)
-            multi_scale.append(feat[:, 0])  # 取CLS token
+        # 双分支处理
+        feat_s = self.branch_small(x)  # [B, N, D]
+        feat_l = self.branch_large(x)  # [B, M, D]
         
-        # 多尺度特征融合
-        fused = torch.cat(multi_scale, dim=1)
-        return self.head(fused)
-    
+        # 交叉注意力
+        feat_s, _ = self.cross_attn(feat_s, feat_l, feat_l)
+        feat_l, _ = self.cross_attn(feat_l, feat_s, feat_s)
+        
+        # 分类特征聚合
+        cls_feat = torch.cat([feat_s[:, 0], feat_l[:, 0]], dim=1)
+        return self.head(cls_feat)
     @classmethod
-    def from_pretrained(cls, config_path, ckpt_path):
-        """加载预训练模型"""
+    def from_pretrained(cls, config_path, model_path=None):
+        """智能加载模型"""
         with open(config_path) as f:
-            config = yaml.safe_load(f)
+            cfg = yaml.safe_load(f)
         
-        model = cls(config)
-        state_dict = torch.load(ckpt_path, map_location='cpu')
-        model.load_state_dict(state_dict)
-        return model.eval()
+        model = cls(cfg['model'])
+        if model_path:
+            state_dict = torch.load(model_path, map_location='cpu')
+            
+            # 处理可能的键不匹配
+            new_dict = {}
+            for k, v in state_dict.items():
+                new_k = k.replace("module.", "")  # 处理DP/DDP保存的权重
+                new_dict[new_k] = v
+            model.load_state_dict(new_dict)
+        
+        return model
 
-    def predict(self, features):
+    def serve(self, img_tensor):
+        """生产环境服务接口"""
         with torch.no_grad():
-            logits = self(features)
-            return torch.softmax(logits, dim=-1)
+            features = self.extract_features(img_tensor)
+            return {
+                'prob_fake': torch.softmax(self(features), dim=-1)[:, 1].cpu().numpy(),
+                'features': features.cpu().numpy()
+            }
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\models\fusion_model.py
        文件内容:
@@ -1119,6 +1123,28 @@ def train_stage2(config):
             loss.backward()
             optimizer.step()
 
+def train_epoch(model, loader, optimizer, cfg):
+    model.train()
+    evaluator = AdvancedEvaluator()
+    
+    for batch_idx, (data, target) in enumerate(loader):
+        data, target = data.to(cfg.device), target.to(cfg.device)
+        
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.cross_entropy(output, target)
+        
+        loss.backward()
+        optimizer.step()
+        
+        evaluator.update(output, target)
+        
+        if batch_idx % cfg.log_interval == 0:
+            metrics = evaluator.compute()
+            print(f"Train Loss: {loss.item():.4f} | AUC: {metrics['ROC_AUC']:.3f}")
+    
+    return evaluator.compute()
+
   └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\utils
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\utils\config.py
        文件内容:
@@ -1228,69 +1254,36 @@ class TrainingLogger:
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\utils\metrics.py
        文件内容:
-    import torch
-from sklearn.metrics import accuracy_score, f1_score
-import time
-from sklearn.metrics import precision_score, recall_score, confusion_matrix
+    from sklearn.metrics import roc_auc_score, average_precision_score
 
-class DetectionEvaluator:
-    """综合评估指标计算器"""
+class AdvancedEvaluator:
     def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        self.preds = []
+        self.probs = []
         self.labels = []
-        self.inference_times = []
-    
-    def update(self, logits: torch.Tensor, labels: torch.Tensor, infer_time: float):
-        preds = torch.argmax(logits, dim=1).cpu().numpy()
-        self.preds.extend(preds)
-        self.labels.extend(labels.cpu().numpy())
-        self.inference_times.append(infer_time)
-    
-    def compute(self):
-        """返回关键指标字典"""
-        acc = accuracy_score(self.labels, self.preds)
-        f1 = f1_score(self.labels, self.preds)
-        avg_time = sum(self.inference_times) / len(self.inference_times)
-        return {
-            'Accuracy': round(acc, 4),
-            'F1-Score': round(f1, 4),
-            'Inference Time (ms)': round(avg_time * 1000, 2),
-            'FPS': round(1 / avg_time, 1) if avg_time > 0 else 0
-        }
-
-class GANDetectionEvaluator:
-    """生成图像检测专用评估模块"""
-    def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        self.preds = []
-        self.targets = []
     
     def update(self, outputs, labels):
-        self.preds.extend(torch.argmax(outputs, dim=1).cpu().numpy())
-        self.targets.extend(labels.cpu().numpy())
+        self.probs.extend(torch.softmax(outputs, dim=1)[:, 1].cpu().numpy())
+        self.labels.extend(labels.cpu().numpy())
     
     def compute(self):
         return {
-            'accuracy': accuracy_score(self.targets, self.preds),
-            'precision': precision_score(self.targets, self.preds),
-            'recall': recall_score(self.targets, self.preds),
-            'f1': f1_score(self.targets, self.preds),
-            'confusion_matrix': confusion_matrix(self.targets, self.preds).tolist()
+            'ROC_AUC': roc_auc_score(self.labels, self.probs),
+            'PR_AUC': average_precision_score(self.labels, self.probs),
+            'Confidence_Hist': self._plot_hist()
         }
     
-    def detailed_report(self):
-        cm = confusion_matrix(self.targets, self.preds)
-        return f"""
-        === 分类报告 ===
-        真实样本准确率: {cm[0,0]/cm[0,:].sum():.2%}
-        生成样本准确率: {cm[1,1]/cm[1,:].sum():.2%}
-        综合F1分数: {self.compute()['f1']:.4f}
-        """
+    def _plot_hist(self):
+        import matplotlib.pyplot as plt
+        plt.hist(
+            [p for p, l in zip(self.probs, self.labels) if l == 0],
+            bins=30, alpha=0.5, label='Real'
+        )
+        plt.hist(
+            [p for p, l in zip(self.probs, self.labels) if l == 1],
+            bins=30, alpha=0.5, label='Fake'
+        )
+        plt.legend()
+        return plt.gcf()
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\utils\profile.py
        文件内容:
