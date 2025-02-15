@@ -1,58 +1,63 @@
-# src/models/crossvit.py
-class CrossScaleAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, scales=[16, 8]):
-        super().__init__()
-        self.scale_embeddings = nn.ModuleList([
-            nn.Conv2d(dim, dim, kernel_size=s, stride=s) for s in scales
-        ])
-        self.attention = nn.MultiheadAttention(dim, num_heads)
-        self.norm = nn.LayerNorm(dim)
+from timm.models.vision_transformer import Block
 
-    def forward(self, local_feat, global_feat):
+class CrossViTClassifier(nn.Module):
+    """
+    完整CrossViT实现,支持：
+    - 多尺度patch嵌入
+    - 交叉注意力机制
+    - 分类头微调
+    """
+    def __init__(self, config):
+        super().__init__()
         # 多尺度嵌入
-        scale_feats = []
-        for emb in self.scale_embeddings:
-            scale_feats.append(emb(global_feat).flatten(2).transpose(1,2))
+        self.patch_embeds = nn.ModuleList([
+            PatchEmbed(img_size=config.img_size, 
+                      patch_size=ps, 
+                      in_chans=config.in_chans,
+                      embed_dim=config.embed_dim)
+            for ps in config.patch_sizes
+        ])
         
-        # 注意力计算
-        query = local_feat.flatten(2).transpose(1,2)
-        key = torch.cat(scale_feats, dim=1)
-        value = key
-        
-        attn_out, _ = self.attention(query, key, value)
-        attn_out = self.norm(attn_out + query)
-        
-        # 恢复空间维度
-        return attn_out.transpose(1,2).view_as(local_feat)
-
-class CrossViT(nn.Module):
-    def __init__(self, in_dims={'dnf':256, 'dire':256, 'lgrad':512, 'ssp':128}):
-        super().__init__()
-        # 输入适配层
-        self.adaptors = nn.ModuleDict({
-            name: nn.Conv2d(dim, 256, 1) for name, dim in in_dims.items()
-        })
-        
-        # 交叉注意力模块
-        self.cross_attn1 = CrossScaleAttention(256)
-        self.cross_attn2 = CrossScaleAttention(256)
+        # 交叉注意力块
+        self.blocks = nn.ModuleList([
+            Block(dim=config.embed_dim, 
+                  num_heads=config.num_heads,
+                  mlp_ratio=config.mlp_ratio)
+            for _ in range(config.depth)
+        ])
         
         # 分类头
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(256, 2)
-        )
+        self.head = nn.Linear(config.embed_dim * len(config.patch_sizes), config.num_classes)
 
-    def forward(self, features):
-        # 统一特征维度
-        aligned = {}
-        for name, feat in features.items():
-            aligned[name] = self.adaptors[name](feat)
+    def forward(self, x):
+        multi_scale = []
+        for embed in self.patch_embeds:
+            # 多尺度特征提取
+            feat = embed(x)
+            cls_token = self.cls_token.expand(feat.shape[0], -1, -1)
+            feat = torch.cat((cls_token, feat), dim=1)
+            
+            # 交叉注意力处理
+            for blk in self.blocks:
+                feat = blk(feat)
+            multi_scale.append(feat[:, 0])  # 取CLS token
         
-        # 层次化融合
-        local_fused = self.cross_attn1(aligned['lgrad'], aligned['ssp'])
-        global_fused = self.cross_attn2(aligned['dnf'], aligned['dire'])
+        # 多尺度特征融合
+        fused = torch.cat(multi_scale, dim=1)
+        return self.head(fused)
+    
+    @classmethod
+    def from_pretrained(cls, config_path, ckpt_path):
+        """加载预训练模型"""
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
         
-        # 最终分类
-        return self.head(local_fused + global_fused)
+        model = cls(config)
+        state_dict = torch.load(ckpt_path, map_location='cpu')
+        model.load_state_dict(state_dict)
+        return model.eval()
+
+    def predict(self, features):
+        with torch.no_grad():
+            logits = self(features)
+            return torch.softmax(logits, dim=-1)

@@ -1,0 +1,22 @@
+data:
+  root: "./data"
+  img_size: 256
+  batch_size: 32
+  num_workers: 4
+
+models:
+  crossvit:
+    config_path: "./config/crossvit.yaml"
+    checkpoint: "./models/trained/crossvit.pth"
+  dnf:
+    checkpoint: "./models/pre-trained/ddnim.pth"
+  dire:
+    vae_path: "./models/pre-trained/vae.pth"
+
+training:
+  lr: 1e-4
+  epochs: 100
+  warmup: 5
+
+evaluation:
+  metrics: ["accuracy", "f1", "confusion_matrix"]

@@ -1,5 +1,5 @@
 处理起始目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1
-处理时间: 2025-02-15 12:23:51
+处理时间: 2025-02-15 12:43:23
 
 └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\config
   └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\config\crossvit.yaml
@@ -62,6 +62,31 @@ optimizer:
   type: "AdamW"
   weight_decay: 0.01
   momentum: 0.9
+
+  └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\config\main.yaml
+     文件内容:
+  data:
+  root: "./data"
+  img_size: 256
+  batch_size: 32
+  num_workers: 4
+
+models:
+  crossvit:
+    config_path: "./config/crossvit.yaml"
+    checkpoint: "./models/trained/crossvit.pth"
+  dnf:
+    checkpoint: "./models/pre-trained/ddnim.pth"
+  dire:
+    vae_path: "./models/pre-trained/vae.pth"
+
+training:
+  lr: 1e-4
+  epochs: 100
+  warmup: 5
+
+evaluation:
+  metrics: ["accuracy", "f1", "confusion_matrix"]
 
   └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\config\__init__.py
      文件内容:
@@ -249,62 +274,32 @@ class GenerativeAwareAugment:
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\datasets\dataset.py
        文件内容:
-    import os
-import torch
-from torch.utils.data import Dataset
-from PIL import Image
-from .preprocess import FeaturePreprocessor
+    from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 
-class MultiFeatureDataset(Dataset):
-    """
-    支持多特征提取的数据集类
-    功能：
-    - 自动加载图像并应用不同特征提取器
-    - 支持对抗样本动态生成
-    """
-    def __init__(self, root_dir, preprocessors, transform=None, is_train=True):
-        """
-        Args:
-            root_dir: 数据集根目录（需包含real_images/和generated_images/）
-            preprocessors: 字典，包含各特征提取器实例
-            transform: 数据增强函数
-        """
-        self.real_dir = os.path.join(root_dir, 'real_images')
-        self.fake_dir = os.path.join(root_dir, 'generated_images')
-        self.real_images = [os.path.join(self.real_dir, f) for f in os.listdir(self.real_dir)]
-        self.fake_images = [os.path.join(self.fake_dir, f) for f in os.listdir(self.fake_dir)]
-        self.all_images = self.real_images + self.fake_images
-        self.labels = [0]*len(self.real_images) + [1]*len(self.fake_images)
-        
-        self.preprocessors = preprocessors  # {'dnf': DNF实例, 'dire': DIRE实例...}
-        self.transform = transform
-        self.feature_align = FeaturePreprocessor()
-        self.is_train = is_train
-
+class GANDataset(torch.utils.data.Dataset):
+    def __init__(self, data_root, split='train', img_size=256):
+        self.paths = self._load_paths(data_root, split)
+        self.transform = Compose([
+            Resize((img_size, img_size)),
+            ToTensor(),
+            Normalize(mean=[0.485, 0.456, 0.406], 
+                     std=[0.229, 0.224, 0.225])
+        ])
+    
+    def _load_paths(self, root, split):
+        real_dir = f"{root}/processed/{split}/real_images"
+        gen_dir = f"{root}/processed/{split}/generated_images"
+        real_paths = [os.path.join(real_dir, f) for f in os.listdir(real_dir)]
+        gen_paths = [os.path.join(gen_dir, f) for f in os.listdir(gen_dir)]
+        return real_paths + gen_paths
+    
     def __len__(self):
-        return len(self.all_images)
-
+        return len(self.paths)
+    
     def __getitem__(self, idx):
-        img_path = self.all_images[idx]
-        label = self.labels[idx]
-        
-        # 加载图像并转换为Tensor
-        img = Image.open(img_path).convert('RGB')
-        img_tensor = torchvision.transforms.ToTensor()(img)
-        
-        # 数据增强（训练时启用）
-        if self.transform and self.is_train:
-            img_tensor = self.transform(img_tensor)
-        
-        # 并行提取各特征
-        features = {}
-        for name, processor in self.preprocessors.items():
-            with torch.set_grad_enabled(name == 'dnf'):  # 仅DNF需要梯度
-                features[name] = processor(img_tensor.unsqueeze(0)).squeeze(0)
-        
-        # 特征对齐
-        aligned_features = self.feature_align(features)
-        return aligned_features, torch.tensor(label, dtype=torch.long)
+        img = Image.open(self.paths[idx]).convert('RGB')
+        label = 0 if 'real_images' in self.paths[idx] else 1
+        return self.transform(img), torch.tensor(label)
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\datasets\preprocess.py
        文件内容:
@@ -386,6 +381,39 @@ class AdversarialAugment:
       └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\features\backbone\resnet_ssl.py
          文件内容:
       
+
+    └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\features\dim_reduction.py
+       文件内容:
+    import torch.nn as nn
+
+class FeatureReducer(nn.Module):
+    """
+    统一特征降维与归一化处理（适用于所有输入特征）
+    支持动态维度适配与多种归一化策略选择
+    """
+    def __init__(self, in_dim, out_dim=256, norm_type='layer'):
+        super().__init__()
+        # 降维层
+        self.reducer = nn.Sequential(
+            nn.Conv2d(in_dim, out_dim, 1),
+            nn.GELU()
+        )
+        
+        # 归一化选择
+        self.norm = {
+            'layer': nn.LayerNorm(out_dim),
+            'batch': nn.BatchNorm2d(out_dim),
+            'instance': nn.InstanceNorm2d(out_dim)
+        }[norm_type]
+
+    def forward(self, x):
+        reduced = self.reducer(x)
+        # 归一化（保持维度兼容性）
+        if isinstance(self.norm, nn.LayerNorm):
+            B, C, H, W = reduced.shape
+            return self.norm(reduced.view(B, C, -1).transpose(1,2)).transpose(1,2).view(B, C, H, W)
+        else:
+            return self.norm(reduced)
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\features\dire.py
        文件内容:
@@ -678,6 +706,23 @@ class FeatureFusion(nn.Module):
         # 拼接并降维
         fused = torch.cat(list(weighted.values()), dim=1)
         return self.fusion_conv(fused)
+    
+class EnhancedFusion(nn.Module):
+    def __init__(self, feat_dims):
+        super().__init__()
+        # 初始化各特征的降维器
+        self.reducers = nn.ModuleDict({
+            name: FeatureReducer(dim, norm_type='layer') 
+            for name, dim in feat_dims.items()
+        })
+        
+        # 注意力融合层
+        self.fusion = FeatureFusion(feat_dims={k:256 for k in feat_dims})
+
+    def forward(self, features):
+        # 降维+归一化
+        reduced_feats = {name: self.reducers[name](feat) for name, feat in features.items()}
+        return self.fusion(reduced_feats)
 
   └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\losses
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\losses\feature_loss.py
@@ -802,64 +847,69 @@ if __name__ == "__main__":
   └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\models
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\models\crossvit.py
        文件内容:
-    # src/models/crossvit.py
-class CrossScaleAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, scales=[16, 8]):
-        super().__init__()
-        self.scale_embeddings = nn.ModuleList([
-            nn.Conv2d(dim, dim, kernel_size=s, stride=s) for s in scales
-        ])
-        self.attention = nn.MultiheadAttention(dim, num_heads)
-        self.norm = nn.LayerNorm(dim)
+    from timm.models.vision_transformer import Block
 
-    def forward(self, local_feat, global_feat):
+class CrossViTClassifier(nn.Module):
+    """
+    完整CrossViT实现,支持：
+    - 多尺度patch嵌入
+    - 交叉注意力机制
+    - 分类头微调
+    """
+    def __init__(self, config):
+        super().__init__()
         # 多尺度嵌入
-        scale_feats = []
-        for emb in self.scale_embeddings:
-            scale_feats.append(emb(global_feat).flatten(2).transpose(1,2))
+        self.patch_embeds = nn.ModuleList([
+            PatchEmbed(img_size=config.img_size, 
+                      patch_size=ps, 
+                      in_chans=config.in_chans,
+                      embed_dim=config.embed_dim)
+            for ps in config.patch_sizes
+        ])
         
-        # 注意力计算
-        query = local_feat.flatten(2).transpose(1,2)
-        key = torch.cat(scale_feats, dim=1)
-        value = key
-        
-        attn_out, _ = self.attention(query, key, value)
-        attn_out = self.norm(attn_out + query)
-        
-        # 恢复空间维度
-        return attn_out.transpose(1,2).view_as(local_feat)
-
-class CrossViT(nn.Module):
-    def __init__(self, in_dims={'dnf':256, 'dire':256, 'lgrad':512, 'ssp':128}):
-        super().__init__()
-        # 输入适配层
-        self.adaptors = nn.ModuleDict({
-            name: nn.Conv2d(dim, 256, 1) for name, dim in in_dims.items()
-        })
-        
-        # 交叉注意力模块
-        self.cross_attn1 = CrossScaleAttention(256)
-        self.cross_attn2 = CrossScaleAttention(256)
+        # 交叉注意力块
+        self.blocks = nn.ModuleList([
+            Block(dim=config.embed_dim, 
+                  num_heads=config.num_heads,
+                  mlp_ratio=config.mlp_ratio)
+            for _ in range(config.depth)
+        ])
         
         # 分类头
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(256, 2)
-        )
+        self.head = nn.Linear(config.embed_dim * len(config.patch_sizes), config.num_classes)
 
-    def forward(self, features):
-        # 统一特征维度
-        aligned = {}
-        for name, feat in features.items():
-            aligned[name] = self.adaptors[name](feat)
+    def forward(self, x):
+        multi_scale = []
+        for embed in self.patch_embeds:
+            # 多尺度特征提取
+            feat = embed(x)
+            cls_token = self.cls_token.expand(feat.shape[0], -1, -1)
+            feat = torch.cat((cls_token, feat), dim=1)
+            
+            # 交叉注意力处理
+            for blk in self.blocks:
+                feat = blk(feat)
+            multi_scale.append(feat[:, 0])  # 取CLS token
         
-        # 层次化融合
-        local_fused = self.cross_attn1(aligned['lgrad'], aligned['ssp'])
-        global_fused = self.cross_attn2(aligned['dnf'], aligned['dire'])
+        # 多尺度特征融合
+        fused = torch.cat(multi_scale, dim=1)
+        return self.head(fused)
+    
+    @classmethod
+    def from_pretrained(cls, config_path, ckpt_path):
+        """加载预训练模型"""
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
         
-        # 最终分类
-        return self.head(local_fused + global_fused)
+        model = cls(config)
+        state_dict = torch.load(ckpt_path, map_location='cpu')
+        model.load_state_dict(state_dict)
+        return model.eval()
+
+    def predict(self, features):
+        with torch.no_grad():
+            logits = self(features)
+            return torch.softmax(logits, dim=-1)
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\models\fusion_model.py
        文件内容:
@@ -1070,6 +1120,23 @@ def train_stage2(config):
             optimizer.step()
 
   └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\utils
+    └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\utils\config.py
+       文件内容:
+    import yaml
+from addict import Dict
+
+def load_config(path):
+    with open(path, 'r') as f:
+        return Dict(yaml.safe_load(f))
+
+def merge_config(base, override):
+    """合并多层配置"""
+    for k, v in override.items():
+        if isinstance(v, dict) and k in base:
+            merge_config(base[k], v)
+        else:
+            base[k] = v
+
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\utils\distributed.py
        文件内容:
     import torch
@@ -1164,6 +1231,7 @@ class TrainingLogger:
     import torch
 from sklearn.metrics import accuracy_score, f1_score
 import time
+from sklearn.metrics import precision_score, recall_score, confusion_matrix
 
 class DetectionEvaluator:
     """综合评估指标计算器"""
@@ -1192,6 +1260,37 @@ class DetectionEvaluator:
             'Inference Time (ms)': round(avg_time * 1000, 2),
             'FPS': round(1 / avg_time, 1) if avg_time > 0 else 0
         }
+
+class GANDetectionEvaluator:
+    """生成图像检测专用评估模块"""
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.preds = []
+        self.targets = []
+    
+    def update(self, outputs, labels):
+        self.preds.extend(torch.argmax(outputs, dim=1).cpu().numpy())
+        self.targets.extend(labels.cpu().numpy())
+    
+    def compute(self):
+        return {
+            'accuracy': accuracy_score(self.targets, self.preds),
+            'precision': precision_score(self.targets, self.preds),
+            'recall': recall_score(self.targets, self.preds),
+            'f1': f1_score(self.targets, self.preds),
+            'confusion_matrix': confusion_matrix(self.targets, self.preds).tolist()
+        }
+    
+    def detailed_report(self):
+        cm = confusion_matrix(self.targets, self.preds)
+        return f"""
+        === 分类报告 ===
+        真实样本准确率: {cm[0,0]/cm[0,:].sum():.2%}
+        生成样本准确率: {cm[1,1]/cm[1,:].sum():.2%}
+        综合F1分数: {self.compute()['f1']:.4f}
+        """
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\utils\profile.py
        文件内容:

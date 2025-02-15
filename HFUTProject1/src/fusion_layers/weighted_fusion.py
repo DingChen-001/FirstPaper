@@ -38,3 +38,20 @@ class FeatureFusion(nn.Module):
         # 拼接并降维
         fused = torch.cat(list(weighted.values()), dim=1)
         return self.fusion_conv(fused)
+    
+class EnhancedFusion(nn.Module):
+    def __init__(self, feat_dims):
+        super().__init__()
+        # 初始化各特征的降维器
+        self.reducers = nn.ModuleDict({
+            name: FeatureReducer(dim, norm_type='layer') 
+            for name, dim in feat_dims.items()
+        })
+        
+        # 注意力融合层
+        self.fusion = FeatureFusion(feat_dims={k:256 for k in feat_dims})
+
+    def forward(self, features):
+        # 降维+归一化
+        reduced_feats = {name: self.reducers[name](feat) for name, feat in features.items()}
+        return self.fusion(reduced_feats)
