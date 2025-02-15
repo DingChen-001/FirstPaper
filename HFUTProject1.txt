@@ -1,7 +1,24 @@
 处理起始目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1
-处理时间: 2025-02-15 10:56:57
+处理时间: 2025-02-15 12:23:51
 
 └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\config
+  └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\config\crossvit.yaml
+     文件内容:
+  model:
+  in_dims:
+    dnf: 256
+    dire: 256
+    lgrad: 512 
+    ssp: 128
+  num_heads: 8
+  scales: [16, 8]
+  hidden_dim: 512
+
+training:
+  lr: 5e-5
+  batch_size: 32
+  num_epochs: 100
+
   └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\config\fusion_config.yaml
      文件内容:
   # 数据配置
@@ -104,7 +121,9 @@ export_to_onnx(model, sample_input, "deploy/fusion_model.onnx")
 
   └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\docs\README.md
      文件内容:
-  # 运行流程
+  # 指令
+
+## 运行流程
 
 - 数据准备：将原始数据按目录结构放入data/raw/
 
@@ -115,6 +134,19 @@ export_to_onnx(model, sample_input, "deploy/fusion_model.onnx")
 - 性能评估：运行 python main.py --stage test
 
 - 模型导出：执行 python deploy/convert_onnx.py
+
+---
+
+## 运行指令
+
+### 分阶段训练
+
+python main.py --stage pretrain --config config/dnf.yaml
+python main.py --stage fusion --config config/crossvit.yaml
+
+### 启用多GPU训练
+
+torchrun --nproc_per_node=4 main.py --stage fusion --config config/crossvit.yaml
 
 
 └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\experiments
@@ -168,21 +200,6 @@ export_to_onnx(model, sample_input, "deploy/fusion_model.onnx")
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\models\trained\ssp_model.pth
        文件内容:
     
-
-└── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\requirements.txt
-   文件内容:
-torch==2.0.1
-torchvision==0.15.2
-diffusers==0.18.2
-transformers==4.31.0
-onnxruntime==1.15.1
-fastapi==0.99.1
-uvicorn==0.22.0
-python-multipart==0.0.6
-scikit-learn==1.3.0
-einops==0.6.1
-tensorboard==2.13.0
-pyyaml==6.0.1
 
 └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src
   └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\datasets
@@ -370,112 +387,182 @@ class AdversarialAugment:
          文件内容:
       
 
+    └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\features\dire.py
+       文件内容:
+    # src/features/dire.py
+class DIREFeature(nn.Module):
+    def __init__(self, model_path="models/dire/diffusion_model"):
+        super().__init__()
+        # 加载预训练扩散模型
+        self.pipe = DiffusionPipeline.from_pretrained(model_path)
+        self.vae = self.pipe.vae
+        self.vae.requires_grad_(False)
+
+        # 多尺度残差计算
+        self.res_blocks = nn.ModuleList([
+            nn.Conv2d(3, 64, 5, stride=2),
+            nn.Conv2d(64, 128, 3, stride=2)
+        ])
+
+    def compute_residual(self, x):
+        """计算扩散重构残差"""
+        # 编码到潜空间
+        latents = self.vae.encode(x).latent_dist.sample()
+        # 解码重建图像
+        recon = self.vae.decode(latents).sample
+        return torch.abs(x - recon) * 10  # 放大残差
+
+    def forward(self, x):
+        residual = self.compute_residual(x)
+        features = []
+        for block in self.res_blocks:
+            residual = block(residual)
+            features.append(F.adaptive_avg_pool2d(residual, 1))
+        return torch.cat(features, dim=1)
+
+    └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\features\dnf.py
+       文件内容:
+    # src/features/dnf.py
+from diffusers import DDIMScheduler, UNet2DModel
+
+class DiffusionNoiseFeature(nn.Module):
+    def __init__(self, ddim_config_path="config/ddim_config.yaml"):
+        super().__init__()
+        # 加载DDIM模型配置
+        with open(ddim_config_path) as f:
+            config = yaml.safe_load(f)
+        
+        # 初始化DDIM组件
+        self.scheduler = DDIMScheduler(
+            num_train_timesteps=config['num_train_timesteps'],
+            beta_schedule=config['beta_schedule']
+        )
+        self.unet = UNet2DModel.from_pretrained(config['model_path'])
+        self.unet.requires_grad_(False)  # 冻结参数
+
+        # 逆向过程噪声预测头
+        self.noise_predictor = nn.Sequential(
+            nn.Conv2d(3, 64, 3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.Conv2d(64, 3, 3, padding=1)
+        )
+
+    def reverse_process(self, x, steps=100):
+        """执行DDIM逆向过程"""
+        x_prev = x.clone()
+        for t in reversed(range(0, steps)):
+            alpha_bar = self.scheduler.alphas_cumprod[t]
+            pred_noise = self.unet(x_prev, t).sample
+            # DDIM更新规则
+            x_prev = (x_prev - (1 - alpha_bar)**0.5 * pred_noise) / alpha_bar**0.5
+        return x_prev
+
+    def forward(self, x):
+        # 步骤1：执行完整逆向过程
+        reversed_x = self.reverse_process(x)
+        # 步骤2：计算预测噪声残差
+        noise_residual = self.noise_predictor(x - reversed_x)
+        return noise_residual.mean(dim=[2,3])  # 全局池化
+
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\features\lgrad.py
        文件内容:
-    import torch
-import torch.nn as nn
-
-class LearnableGradient(nn.Module):
-    """
-    LGrad特征提取器：基于深度梯度学习的伪影检测
-    论文核心：生成图像的梯度模式与真实图像存在差异
-    """
-    def __init__(self, pretrained_path='models/pre-trained/resnet50.pth'):
+    # src/features/lgrad.py
+class GradientOperator(nn.Module):
+    """自定义梯度特征计算层"""
+    def __init__(self):
         super().__init__()
-        # 加载预训练ResNet并提取中间梯度
-        self.backbone = ResNet50(pretrained_path)
-        self.grad_layers = ['layer3', 'layer4']
-        
-        # 梯度特征处理（参考lgrad.txt的GradientStream模块）
-        self.grad_processor = nn.Sequential(
-            nn.Conv2d(2048, 512, 1),
-            nn.ReLU(),
-            nn.Conv2d(512, 256, 3, padding=1)
+        # Sobel算子参数
+        self.sobel_x = nn.Parameter(
+            torch.tensor([[[1, 0, -1], [2, 0, -2], [1, 0, -1]]], dtype=torch.float32),
+            requires_grad=False
         )
+        self.sobel_y = nn.Parameter(
+            torch.tensor([[[1, 2, 1], [0, 0, 0], [-1, -2, -1]]], dtype=torch.float32),
+            requires_grad=False
+        )
+
+    def forward(self, x):
+        # 计算梯度幅值和方向
+        g_x = F.conv2d(x, self.sobel_x.repeat(x.shape[1],1,1,1))
+        g_y = F.conv2d(x, self.sobel_y.repeat(x.shape[1],1,1,1))
+        magnitude = torch.sqrt(g_x**2 + g_y**2)
+        orientation = torch.atan2(g_y, g_x)
+        return torch.cat([magnitude, orientation], dim=1)
+
+class LGradFeature(nn.Module):
+    def __init__(self, pretrained_path="models/pre-trained/resnet50.pth"):
+        super().__init__()
+        self.grad_op = GradientOperator()
+        self.backbone = ResNet50(pretrained=True)
         
         # 注册梯度钩子
         self.gradients = {}
-        for name, module in self.backbone.named_modules():
-            if name in self.grad_layers:
-                module.register_forward_hook(self.save_gradient)
-    
-    def save_gradient(self, module, input, output):
-        """保存中间层的梯度"""
-        def grad_hook(grad):
-            self.gradients[module] = grad
-        output.register_hook(grad_hook)
-    
+        def save_grad(name):
+            def hook(grad):
+                self.gradients[name] = grad
+            return hook
+        
+        self.backbone.layer3.register_forward_hook(save_grad('layer3'))
+        self.backbone.layer4.register_forward_hook(save_grad('layer4'))
+
     def forward(self, x):
-        # 前向传播获取梯度
+        # 原始图像梯度特征
+        raw_grad = self.grad_op(x)
+        
+        # 深度特征梯度
         _ = self.backbone(x)
+        layer3_grad = self.gradients['layer3']
+        layer4_grad = self.gradients['layer4']
         
-        # 提取并处理梯度特征
-        grad_feats = []
-        for layer in self.grad_layers:
-            grad = self.gradients[layer]
-            processed = self.grad_processor(grad)
-            grad_feats.append(F.adaptive_avg_pool2d(processed, (256, 256)))
-        
-        return torch.cat(grad_feats, dim=1)  # [B, 512, 256, 256]
+        # 特征融合
+        return torch.cat([
+            raw_grad,
+            F.interpolate(layer3_grad, scale_factor=2),
+            F.interpolate(layer4_grad, scale_factor=4)
+        ], dim=1)
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\features\ssp.py
        文件内容:
-    import torch
-import torch.nn as nn
-
-class SingleSimplePatch(nn.Module):
-    """
-    SSP特征提取器：基于局部图像块的统计特征
-    论文核心：生成图像在局部块内具有统计异常
-    """
-    def __init__(self, patch_size=64, num_patches=16):
+    # src/features/ssp.py
+class PatchSelector(nn.Module):
+    """动态高频补丁选择模块"""
+    def __init__(self, patch_size=64, top_k=5):
         super().__init__()
         self.patch_size = patch_size
-        self.num_patches = num_patches
-        
-        # 特征编码器（参考源码ssp.txt的LightweightStatsNet）
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.AdaptiveAvgPool2d(1)
-        )
-        
-    def random_patch(self, x):
-        """动态选择高方差区域块（源码改进版）"""
-        # 计算局部方差图
-        unfolded = F.unfold(x, kernel_size=16, stride=8)
-        variances = torch.var(unfolded, dim=1)  # [B, H*W]
-        
-        # 选择高方差区域索引
-        _, top_indices = torch.topk(variances, self.num_patches, dim=1)
-        return top_indices
+        self.top_k = top_k
+        self.variance_conv = nn.Conv2d(3, 1, patch_size, stride=patch_size//2)
 
     def forward(self, x):
-        """
-        输入: x [B, 3, H, W]
-        输出: SSP特征 [B, 128]
-        """
-        # 动态选择图像块
-        indices = self.random_patch(x)
-        
-        # 提取块特征
-        batch_features = []
+        # 计算局部方差图
+        var_map = self.variance_conv(x**2) - (self.variance_conv(x))**2
+        # 选择方差最大的k个区域
+        B, _, H, W = var_map.shape
+        _, indices = torch.topk(var_map.view(B, -1), self.top_k)
+        return indices
+
+class SSPFeature(nn.Module):
+    def __init__(self, encoder_dim=128):
+        super().__init__()
+        self.selector = PatchSelector()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.InstanceNorm2d(32),
+            nn.Conv2d(32, encoder_dim, 3, padding=1)
+        )
+
+    def extract_patches(self, x, indices):
+        patches = []
         for b in range(x.size(0)):
-            patches = []
-            for idx in indices[b]:
-                # 计算块位置
-                h = (idx // (x.size(3)//8)) * 8
-                w = (idx % (x.size(3)//8)) * 8
-                patch = x[b, :, h:h+self.patch_size, w:w+self.patch_size]
-                patches.append(patch)
-            
-            # 编码块特征
-            patches = torch.stack(patches)  # [num_patches, C, H, W]
-            features = self.encoder(patches).squeeze(-1).squeeze(-1)
-            batch_features.append(features.mean(dim=0))  # 平均所有块
-        
-        return torch.stack(batch_features)
+            h = (indices[b] // x.size(3)) * (self.selector.patch_size // 2)
+            w = (indices[b] % x.size(3)) * (self.selector.patch_size // 2)
+            patches.append(x[b:b+1, :, h:h+self.selector.patch_size, w:w+self.selector.patch_size])
+        return torch.cat(patches, dim=0)
+
+    def forward(self, x):
+        indices = self.selector(x)
+        patches = self.extract_patches(x, indices)
+        encoded = self.encoder(patches)
+        return encoded.mean(dim=[2,3])  # 全局平均
 
   └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\fusion_layers
     └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\fusion_layers\crossvit_utils
@@ -551,43 +638,46 @@ class CrossScaleAttention(nn.Module):
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\fusion_layers\weighted_fusion.py
        文件内容:
-    import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class DynamicFeatureFusion(nn.Module):
-    """
-    动态加权多特征融合模块
-    功能：为DNF、DIRE、LGrad、SSP特征分配可学习权重
-    论文参考：DNF论文中的动态特征选择策略
-    """
-    def __init__(self, num_features=4, hidden_dim=128):
+    # src/fusion_layers/weighted_fusion.py
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
         super().__init__()
-        # 权重生成网络（输入为各特征的均值）
-        self.weight_net = nn.Sequential(
-            nn.Linear(num_features * hidden_dim, hidden_dim),
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes//ratio, 1),
             nn.ReLU(),
-            nn.Linear(hidden_dim, num_features)
+            nn.Conv2d(in_planes//ratio, in_planes, 1)
         )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        return self.sigmoid(avg_out + max_out)
+
+class FeatureFusion(nn.Module):
+    def __init__(self, feature_dims):
+        super().__init__()
+        self.attentions = nn.ModuleDict({
+            name: ChannelAttention(dim) for name, dim in feature_dims.items()
+        })
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(sum(feature_dims.values()), 512, 1),
+            nn.BatchNorm2d(512),
+            nn.GELU()
+        )
+
+    def forward(self, features):
+        # 通道注意力加权
+        weighted = {}
+        for name, feat in features.items():
+            attn = self.attentions[name](feat)
+            weighted[name] = feat * attn
         
-    def forward(self, features: dict) -> torch.Tensor:
-        """
-        输入: features字典包含各特征张量（已对齐为相同尺寸）
-        输出: 加权融合后的特征 [B, C, H, W]
-        """
-        # 拼接各特征的均值统计量
-        stats = [torch.mean(feat, dim=[1,2,3]) for feat in features.values()]
-        stats = torch.cat(stats, dim=1)  # [B, num_features*C]
-        
-        # 生成归一化权重
-        weights = F.softmax(self.weight_net(stats), dim=1)  # [B, 4]
-        
-        # 加权融合
-        weighted_feats = []
-        for i, (name, feat) in enumerate(features.items()):
-            weighted_feats.append(feat * weights[:, i].view(-1,1,1,1))
-        
-        return torch.sum(torch.stack(weighted_feats), dim=0)  # 求和融合
+        # 拼接并降维
+        fused = torch.cat(list(weighted.values()), dim=1)
+        return self.fusion_conv(fused)
 
   └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\losses
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\losses\feature_loss.py
@@ -712,69 +802,64 @@ if __name__ == "__main__":
   └── 目录: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\models
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\models\crossvit.py
        文件内容:
-    import torch
-from torch import nn
-from einops import rearrange
-
-class CrossAttentionBlock(nn.Module):
-    """
-    CrossViT的交叉注意力模块（参考crossvit.txt核心组件）
-    输入：两个不同尺度的特征序列
-    输出：交叉注意力增强后的融合特征
-    """
-    def __init__(self, dim, num_heads=8):
+    # src/models/crossvit.py
+class CrossScaleAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, scales=[16, 8]):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads)
-        
-    def forward(self, x, context):
-        # 交换序列维度与通道维度
-        x = rearrange(x, "b c h w -> (h w) b c")
-        context = rearrange(context, "b c h w -> (h w) b c")
-        
-        # 交叉注意力（以x为query，context为key/value）
-        attn_out, _ = self.attn(
-            query=self.norm1(x),
-            key=self.norm1(context),
-            value=self.norm1(context)
-        )
-        x = x + attn_out  # 残差连接
-        return rearrange(x, "(h w) b c -> b c h w", h=int(x.shape[0]**0.5))
+        self.scale_embeddings = nn.ModuleList([
+            nn.Conv2d(dim, dim, kernel_size=s, stride=s) for s in scales
+        ])
+        self.attention = nn.MultiheadAttention(dim, num_heads)
+        self.norm = nn.LayerNorm(dim)
 
-class CrossViTFusion(nn.Module):
-    """
-    多尺度CrossViT融合模型（支持两阶段层次化融合）
-    """
-    def __init__(self, in_dim=256, num_classes=2):
+    def forward(self, local_feat, global_feat):
+        # 多尺度嵌入
+        scale_feats = []
+        for emb in self.scale_embeddings:
+            scale_feats.append(emb(global_feat).flatten(2).transpose(1,2))
+        
+        # 注意力计算
+        query = local_feat.flatten(2).transpose(1,2)
+        key = torch.cat(scale_feats, dim=1)
+        value = key
+        
+        attn_out, _ = self.attention(query, key, value)
+        attn_out = self.norm(attn_out + query)
+        
+        # 恢复空间维度
+        return attn_out.transpose(1,2).view_as(local_feat)
+
+class CrossViT(nn.Module):
+    def __init__(self, in_dims={'dnf':256, 'dire':256, 'lgrad':512, 'ssp':128}):
         super().__init__()
-        # 局部分支（处理高频特征：SSP和LGrad）
-        self.local_branch = CrossAttentionBlock(in_dim)
-        # 全局分支（处理语义特征：DNF和DIRE）
-        self.global_branch = CrossAttentionBlock(in_dim)
+        # 输入适配层
+        self.adaptors = nn.ModuleDict({
+            name: nn.Conv2d(dim, 256, 1) for name, dim in in_dims.items()
+        })
+        
+        # 交叉注意力模块
+        self.cross_attn1 = CrossScaleAttention(256)
+        self.cross_attn2 = CrossScaleAttention(256)
         
         # 分类头
         self.head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(in_dim, num_classes)
+            nn.Linear(256, 2)
+        )
+
+    def forward(self, features):
+        # 统一特征维度
+        aligned = {}
+        for name, feat in features.items():
+            aligned[name] = self.adaptors[name](feat)
         
-    def forward(self, features: dict) -> torch.Tensor:
-        # 提取各特征
-        dnf = features['dnf']
-        dire = features['dire']
-        lgrad = features['lgrad']
-        ssp = features['ssp']
+        # 层次化融合
+        local_fused = self.cross_attn1(aligned['lgrad'], aligned['ssp'])
+        global_fused = self.cross_attn2(aligned['dnf'], aligned['dire'])
         
-        # 第一阶段：局部特征融合（SSP + LGrad）
-        local_fused = self.local_branch(ssp, lgrad)
-        
-        # 第二阶段：全局特征融合（DNF + DIRE）
-        global_fused = self.global_branch(dnf, dire)
-        
-        # 拼接融合结果
-        final_feature = torch.cat([local_fused, global_fused], dim=1)
-        return self.head(final_feature)
+        # 最终分类
+        return self.head(local_fused + global_fused)
 
     └── 文件路径: S:\Notes\HFUT\Experiment\_228\HFUTProject1\src\models\fusion_model.py
        文件内容:

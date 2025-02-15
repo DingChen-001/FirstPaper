@@ -1,37 +1,40 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class DynamicFeatureFusion(nn.Module):
-    """
-    动态加权多特征融合模块
-    功能：为DNF、DIRE、LGrad、SSP特征分配可学习权重
-    论文参考：DNF论文中的动态特征选择策略
-    """
-    def __init__(self, num_features=4, hidden_dim=128):
+# src/fusion_layers/weighted_fusion.py
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
         super().__init__()
-        # 权重生成网络（输入为各特征的均值）
-        self.weight_net = nn.Sequential(
-            nn.Linear(num_features * hidden_dim, hidden_dim),
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes//ratio, 1),
             nn.ReLU(),
-            nn.Linear(hidden_dim, num_features)
+            nn.Conv2d(in_planes//ratio, in_planes, 1)
         )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        return self.sigmoid(avg_out + max_out)
+
+class FeatureFusion(nn.Module):
+    def __init__(self, feature_dims):
+        super().__init__()
+        self.attentions = nn.ModuleDict({
+            name: ChannelAttention(dim) for name, dim in feature_dims.items()
+        })
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(sum(feature_dims.values()), 512, 1),
+            nn.BatchNorm2d(512),
+            nn.GELU()
+        )
+
+    def forward(self, features):
+        # 通道注意力加权
+        weighted = {}
+        for name, feat in features.items():
+            attn = self.attentions[name](feat)
+            weighted[name] = feat * attn
         
-    def forward(self, features: dict) -> torch.Tensor:
-        """
-        输入: features字典包含各特征张量（已对齐为相同尺寸）
-        输出: 加权融合后的特征 [B, C, H, W]
-        """
-        # 拼接各特征的均值统计量
-        stats = [torch.mean(feat, dim=[1,2,3]) for feat in features.values()]
-        stats = torch.cat(stats, dim=1)  # [B, num_features*C]
-        
-        # 生成归一化权重
-        weights = F.softmax(self.weight_net(stats), dim=1)  # [B, 4]
-        
-        # 加权融合
-        weighted_feats = []
-        for i, (name, feat) in enumerate(features.items()):
-            weighted_feats.append(feat * weights[:, i].view(-1,1,1,1))
-        
-        return torch.sum(torch.stack(weighted_feats), dim=0)  # 求和融合
+        # 拼接并降维
+        fused = torch.cat(list(weighted.values()), dim=1)
+        return self.fusion_conv(fused)

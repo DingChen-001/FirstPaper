@@ -1,0 +1,14 @@
+model:
+  in_dims:
+    dnf: 256
+    dire: 256
+    lgrad: 512 
+    ssp: 128
+  num_heads: 8
+  scales: [16, 8]
+  hidden_dim: 512
+
+training:
+  lr: 5e-5
+  batch_size: 32
+  num_epochs: 100

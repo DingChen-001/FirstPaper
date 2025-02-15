@@ -1,56 +1,40 @@
-import torch
-import torch.nn as nn
-
-class SingleSimplePatch(nn.Module):
-    """
-    SSP特征提取器：基于局部图像块的统计特征
-    论文核心：生成图像在局部块内具有统计异常
-    """
-    def __init__(self, patch_size=64, num_patches=16):
+# src/features/ssp.py
+class PatchSelector(nn.Module):
+    """动态高频补丁选择模块"""
+    def __init__(self, patch_size=64, top_k=5):
         super().__init__()
         self.patch_size = patch_size
-        self.num_patches = num_patches
-        
-        # 特征编码器（参考源码ssp.txt的LightweightStatsNet）
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.AdaptiveAvgPool2d(1)
-        )
-        
-    def random_patch(self, x):
-        """动态选择高方差区域块（源码改进版）"""
-        # 计算局部方差图
-        unfolded = F.unfold(x, kernel_size=16, stride=8)
-        variances = torch.var(unfolded, dim=1)  # [B, H*W]
-        
-        # 选择高方差区域索引
-        _, top_indices = torch.topk(variances, self.num_patches, dim=1)
-        return top_indices
+        self.top_k = top_k
+        self.variance_conv = nn.Conv2d(3, 1, patch_size, stride=patch_size//2)
 
     def forward(self, x):
-        """
-        输入: x [B, 3, H, W]
-        输出: SSP特征 [B, 128]
-        """
-        # 动态选择图像块
-        indices = self.random_patch(x)
-        
-        # 提取块特征
-        batch_features = []
+        # 计算局部方差图
+        var_map = self.variance_conv(x**2) - (self.variance_conv(x))**2
+        # 选择方差最大的k个区域
+        B, _, H, W = var_map.shape
+        _, indices = torch.topk(var_map.view(B, -1), self.top_k)
+        return indices
+
+class SSPFeature(nn.Module):
+    def __init__(self, encoder_dim=128):
+        super().__init__()
+        self.selector = PatchSelector()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.InstanceNorm2d(32),
+            nn.Conv2d(32, encoder_dim, 3, padding=1)
+        )
+
+    def extract_patches(self, x, indices):
+        patches = []
         for b in range(x.size(0)):
-            patches = []
-            for idx in indices[b]:
-                # 计算块位置
-                h = (idx // (x.size(3)//8)) * 8
-                w = (idx % (x.size(3)//8)) * 8
-                patch = x[b, :, h:h+self.patch_size, w:w+self.patch_size]
-                patches.append(patch)
-            
-            # 编码块特征
-            patches = torch.stack(patches)  # [num_patches, C, H, W]
-            features = self.encoder(patches).squeeze(-1).squeeze(-1)
-            batch_features.append(features.mean(dim=0))  # 平均所有块
-        
-        return torch.stack(batch_features)
+            h = (indices[b] // x.size(3)) * (self.selector.patch_size // 2)
+            w = (indices[b] % x.size(3)) * (self.selector.patch_size // 2)
+            patches.append(x[b:b+1, :, h:h+self.selector.patch_size, w:w+self.selector.patch_size])
+        return torch.cat(patches, dim=0)
+
+    def forward(self, x):
+        indices = self.selector(x)
+        patches = self.extract_patches(x, indices)
+        encoded = self.encoder(patches)
+        return encoded.mean(dim=[2,3])  # 全局平均

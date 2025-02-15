@@ -1,45 +1,54 @@
-import torch
-import torch.nn as nn
-
-class LearnableGradient(nn.Module):
-    """
-    LGrad特征提取器：基于深度梯度学习的伪影检测
-    论文核心：生成图像的梯度模式与真实图像存在差异
-    """
-    def __init__(self, pretrained_path='models/pre-trained/resnet50.pth'):
+# src/features/lgrad.py
+class GradientOperator(nn.Module):
+    """自定义梯度特征计算层"""
+    def __init__(self):
         super().__init__()
-        # 加载预训练ResNet并提取中间梯度
-        self.backbone = ResNet50(pretrained_path)
-        self.grad_layers = ['layer3', 'layer4']
-        
-        # 梯度特征处理（参考lgrad.txt的GradientStream模块）
-        self.grad_processor = nn.Sequential(
-            nn.Conv2d(2048, 512, 1),
-            nn.ReLU(),
-            nn.Conv2d(512, 256, 3, padding=1)
+        # Sobel算子参数
+        self.sobel_x = nn.Parameter(
+            torch.tensor([[[1, 0, -1], [2, 0, -2], [1, 0, -1]]], dtype=torch.float32),
+            requires_grad=False
         )
+        self.sobel_y = nn.Parameter(
+            torch.tensor([[[1, 2, 1], [0, 0, 0], [-1, -2, -1]]], dtype=torch.float32),
+            requires_grad=False
+        )
+
+    def forward(self, x):
+        # 计算梯度幅值和方向
+        g_x = F.conv2d(x, self.sobel_x.repeat(x.shape[1],1,1,1))
+        g_y = F.conv2d(x, self.sobel_y.repeat(x.shape[1],1,1,1))
+        magnitude = torch.sqrt(g_x**2 + g_y**2)
+        orientation = torch.atan2(g_y, g_x)
+        return torch.cat([magnitude, orientation], dim=1)
+
+class LGradFeature(nn.Module):
+    def __init__(self, pretrained_path="models/pre-trained/resnet50.pth"):
+        super().__init__()
+        self.grad_op = GradientOperator()
+        self.backbone = ResNet50(pretrained=True)
         
         # 注册梯度钩子
         self.gradients = {}
-        for name, module in self.backbone.named_modules():
-            if name in self.grad_layers:
-                module.register_forward_hook(self.save_gradient)
-    
-    def save_gradient(self, module, input, output):
-        """保存中间层的梯度"""
-        def grad_hook(grad):
-            self.gradients[module] = grad
-        output.register_hook(grad_hook)
-    
+        def save_grad(name):
+            def hook(grad):
+                self.gradients[name] = grad
+            return hook
+        
+        self.backbone.layer3.register_forward_hook(save_grad('layer3'))
+        self.backbone.layer4.register_forward_hook(save_grad('layer4'))
+
     def forward(self, x):
-        # 前向传播获取梯度
+        # 原始图像梯度特征
+        raw_grad = self.grad_op(x)
+        
+        # 深度特征梯度
         _ = self.backbone(x)
+        layer3_grad = self.gradients['layer3']
+        layer4_grad = self.gradients['layer4']
         
-        # 提取并处理梯度特征
-        grad_feats = []
-        for layer in self.grad_layers:
-            grad = self.gradients[layer]
-            processed = self.grad_processor(grad)
-            grad_feats.append(F.adaptive_avg_pool2d(processed, (256, 256)))
-        
-        return torch.cat(grad_feats, dim=1)  # [B, 512, 256, 256]
+        # 特征融合
+        return torch.cat([
+            raw_grad,
+            F.interpolate(layer3_grad, scale_factor=2),
+            F.interpolate(layer4_grad, scale_factor=4)
+        ], dim=1)
