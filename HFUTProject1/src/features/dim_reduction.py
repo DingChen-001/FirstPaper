@@ -1,30 +1,46 @@
+import torch
 import torch.nn as nn
+from sklearn.decomposition import PCA
 
-class FeatureReducer(nn.Module):
+class HybridReducer(nn.Module):
     """
-    统一特征降维与归一化处理（适用于所有输入特征）
-    支持动态维度适配与多种归一化策略选择
+    混合降维策略：
+    - 训练阶段：使用可学习的1x1卷积降维
+    - 推理阶段：可选PCA降维（需提前拟合）
+    - 支持多种归一化方法
     """
-    def __init__(self, in_dim, out_dim=256, norm_type='layer'):
+    def __init__(self, in_dim, out_dim=256, norm_type='bn', use_pca=False):
         super().__init__()
-        # 降维层
-        self.reducer = nn.Sequential(
+        # 可学习降维
+        self.conv_reducer = nn.Sequential(
             nn.Conv2d(in_dim, out_dim, 1),
             nn.GELU()
         )
         
-        # 归一化选择
+        # PCA降维器
+        self.pca = PCA(n_components=out_dim) if use_pca else None
+        self.use_pca = use_pca
+        
+        # 归一化层
         self.norm = {
-            'layer': nn.LayerNorm(out_dim),
-            'batch': nn.BatchNorm2d(out_dim),
-            'instance': nn.InstanceNorm2d(out_dim)
+            'bn': nn.BatchNorm2d(out_dim),
+            'ln': nn.LayerNorm([out_dim, 1, 1]),
+            'in': nn.InstanceNorm2d(out_dim)
         }[norm_type]
 
+    def fit_pca(self, features):
+        """离线拟合PCA"""
+        flattened = features.view(-1, features.size(1)).cpu().numpy()
+        self.pca.fit(flattened)
+        
     def forward(self, x):
-        reduced = self.reducer(x)
-        # 归一化（保持维度兼容性）
-        if isinstance(self.norm, nn.LayerNorm):
-            B, C, H, W = reduced.shape
-            return self.norm(reduced.view(B, C, -1).transpose(1,2)).transpose(1,2).view(B, C, H, W)
+        if self.training or not self.use_pca:
+            # 训练模式使用卷积降维
+            reduced = self.conv_reducer(x)
         else:
-            return self.norm(reduced)
+            # 推理模式可选PCA
+            x_flat = x.permute(0,2,3,1).view(-1, x.size(1))
+            reduced = torch.tensor(self.pca.transform(x_flat.cpu())).to(x.device)
+            reduced = reduced.view(x.size(0), x.size(2), x.size(3), -1).permute(0,3,1,2)
+            
+        return self.norm(reduced)

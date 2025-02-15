@@ -60,3 +60,25 @@ def train_stage2(config):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+def train_epoch(model, loader, optimizer, cfg):
+    model.train()
+    evaluator = AdvancedEvaluator()
+    
+    for batch_idx, (data, target) in enumerate(loader):
+        data, target = data.to(cfg.device), target.to(cfg.device)
+        
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.cross_entropy(output, target)
+        
+        loss.backward()
+        optimizer.step()
+        
+        evaluator.update(output, target)
+        
+        if batch_idx % cfg.log_interval == 0:
+            metrics = evaluator.compute()
+            print(f"Train Loss: {loss.item():.4f} | AUC: {metrics['ROC_AUC']:.3f}")
+    
+    return evaluator.compute()
